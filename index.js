@@ -1,5 +1,3 @@
-console.log('DATA_DIR en runtime:', process.env.DATA_DIR);
-
 require('dotenv').config();
 
 const express = require('express');
@@ -10,6 +8,17 @@ const { DateTime } = require('luxon');
 
 const app = express();
 app.use(express.json());
+
+// Carpeta de datos persistentes.
+// En el VPS: /app/data (montado como volumen).
+// En local: carpeta del proyecto (si no existe DATA_DIR).
+const DATA_DIR = process.env.DATA_DIR || __dirname;
+
+// Archivo donde se guardan los vehículos
+const VEHICULOS_FILE = path.join(DATA_DIR, 'vehiculos.json');
+
+console.log('Usando archivo de vehículos en:', VEHICULOS_FILE);
+
 
 // ---------------------------
 // Configuracion basica
@@ -64,10 +73,6 @@ const CORTE_UMBRAL_KMH = 20;
 // Persistencia simple en archivo
 // ---------------------------
 
-// Carpeta base donde se guardará vehiculos.json
-// En el VPS apunta al volumen (ej: /app/data), y en local usa la carpeta del proyecto
-const DATA_DIR = process.env.DATA_DIR || __dirname;
-const VEHICULOS_FILE = path.join(DATA_DIR, 'vehiculos.json');
 let VEHICULOS = {};
 let ESTADO_CORTE = {}; // memoria en runtime
 let ESTADO_ZONA = {}; // estado de zona segura por vehiculo: 'dentro' | 'fuera' | 'fuera_horario' | 'desconocido'
