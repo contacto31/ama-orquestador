@@ -62,7 +62,10 @@ const CORTE_UMBRAL_KMH = 20;
 // Persistencia simple en archivo
 // ---------------------------
 
-const VEHICULOS_FILE = path.join(__dirname, 'vehiculos.json');
+// Carpeta base donde se guardará vehiculos.json
+// En el VPS apunta al volumen (ej: /app/data), y en local usa la carpeta del proyecto
+const DATA_DIR = process.env.DATA_DIR || __dirname;
+const VEHICULOS_FILE = path.join(DATA_DIR, 'vehiculos.json');
 let VEHICULOS = {};
 let ESTADO_CORTE = {}; // memoria en runtime
 let ESTADO_ZONA = {}; // estado de zona segura por vehiculo: 'dentro' | 'fuera' | 'fuera_horario' | 'desconocido'
