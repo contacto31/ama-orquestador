@@ -1,3 +1,5 @@
+console.log('DATA_DIR en runtime:', process.env.DATA_DIR);
+
 require('dotenv').config();
 
 const express = require('express');
