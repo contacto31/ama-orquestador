@@ -1286,50 +1286,7 @@ app.post('/api/vehiculos/:vehiculoId/zona-segura/desactivar', (req, res) => {
     });
   }
 
-// ACTIVAR Zona Segura existente
-app.post('/api/vehiculos/:vehiculoId/zona-segura/activar', (req, res) => {
-  try {
-    const { vehiculoId } = req.params;
-
-    // OJO: cargarVehiculos devuelve directamente el mapa { [vehiculoId]: vehiculo }
-    const vehiculos = cargarVehiculos();
-    const vehiculo = vehiculos[vehiculoId];
-
-    if (!vehiculo) {
-      return res.status(404).json({
-        error: 'Vehiculo no encontrado en el Orquestador'
-      });
-    }
-
-    if (!vehiculo.zonaSegura) {
-      return res.status(409).json({
-        error: 'Zona Segura no configurada',
-        detalle: 'Primero configura una Zona Segura con POST /api/vehiculos/:vehiculoId/zona-segura'
-      });
-    }
-
-    // Solo prendemos la zona, sin cambiar la configuración
-    vehiculo.zonaSegura.activo = true;
-
-    guardarVehiculos(vehiculos);
-
-    return res.json({
-      ok: true,
-      vehiculoId,
-      contratoId: vehiculo.contratoId,
-      zonaSegura: vehiculo.zonaSegura,
-      mensaje: 'Zona Segura activada correctamente'
-    });
-  } catch (err) {
-    console.error('Error activando Zona Segura', err);
-    return res.status(500).json({
-      error: 'Error interno activando Zona Segura',
-      detalle: err.message
-    });
-  }
-});
-
-
+  // Aquí sí desactivamos
   zona.activo = false;
   guardarVehiculos();
 
@@ -1348,6 +1305,58 @@ app.post('/api/vehiculos/:vehiculoId/zona-segura/activar', (req, res) => {
       'Zona Segura desactivada. La configuracion se mantiene pero no generara alertas.'
   });
 });
+
+// ACTIVAR Zona Segura existente
+app.post('/api/vehiculos/:vehiculoId/zona-segura/activar', (req, res) => {
+  const vehiculoId = req.params.vehiculoId;
+  const config = VEHICULOS[vehiculoId];
+
+  if (!config) {
+    return res
+      .status(404)
+      .json({ error: 'Vehiculo no configurado en el Orquestador' });
+  }
+
+  const zona = config.zonaSegura;
+
+  if (!zona) {
+    return res.status(409).json({
+      error: 'El vehiculo no tiene Zona Segura configurada. Debe crearla primero.'
+    });
+  }
+
+  if (zona.activo === true) {
+    return res.json({
+      ok: false,
+      vehiculoId,
+      contratoId: config.contratoId,
+      zonaSegura: {
+        nombre: zona.nombre,
+        activo: zona.activo
+      },
+      mensaje: 'La Zona Segura ya se encontraba activada.'
+    });
+  }
+
+  // Activamos la zona
+  zona.activo = true;
+  guardarVehiculos();
+
+  // Reiniciamos el estado en memoria para que el motor vuelva a evaluarla
+  ESTADO_ZONA[vehiculoId] = 'desconocido';
+
+  return res.json({
+    ok: true,
+    vehiculoId,
+    contratoId: config.contratoId,
+    zonaSegura: {
+      nombre: zona.nombre,
+      activo: zona.activo
+    },
+    mensaje: 'Zona Segura activada correctamente.'
+  });
+});
+
 
 // Obtener configuracion de Zona Segura
 app.get('/api/vehiculos/:vehiculoId/zona-segura', (req, res) => {
