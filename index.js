@@ -1,188 +1,155 @@
-require('dotenv').config();
-
+// index.js
 const express = require('express');
 const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
 const { DateTime } = require('luxon');
+require('dotenv').config();
 
 const app = express();
 app.use(express.json());
 
-// Carpeta de datos persistentes.
-// En el VPS: /app/data (montado como volumen).
-// En local: carpeta del proyecto (si no existe DATA_DIR).
-const DATA_DIR = process.env.DATA_DIR || __dirname;
+const PORT = process.env.PORT || 3000;
+const TIMEZONE = process.env.TIMEZONE || 'America/Mexico_City';
 
-// Archivo donde se guardan los vehículos
+const DATA_DIR = process.env.DATA_DIR || __dirname;
 const VEHICULOS_FILE = path.join(DATA_DIR, 'vehiculos.json');
 
+console.log('DATA_DIR en runtime:', DATA_DIR);
 console.log('Usando archivo de vehículos en:', VEHICULOS_FILE);
 
+// ---------- Utilidades de almacenamiento local ----------
 
-// ---------------------------
-// Configuracion basica
-// ---------------------------
-
-const PORT = process.env.PORT || 3000;
-
-const TRACCAR_URL = process.env.TRACCAR_URL; // ej. "http://31.97.135.112:8082"
-const TRACCAR_USER = process.env.TRACCAR_USER;
-const TRACCAR_PASSWORD = process.env.TRACCAR_PASSWORD;
-
-// URL del orquestador para eventos de Zona Segura
-const ORQ_EVENT_URL = process.env.ORQ_EVENT_URL || null;
-
-// Intervalo de evaluacion de Zona Segura
-const ZONA_SEGURA_INTERVALO_SEGUNDOS = parseInt(
-  process.env.ZONA_SEGURA_INTERVALO_SEGUNDOS || '60',
-  10
-);
-const ZONA_SEGURA_INTERVALO_MS =
-  Number.isNaN(ZONA_SEGURA_INTERVALO_SEGUNDOS) || ZONA_SEGURA_INTERVALO_SEGUNDOS <= 0
-    ? 0
-    : ZONA_SEGURA_INTERVALO_SEGUNDOS * 1000;
-
-if (!TRACCAR_URL || !TRACCAR_USER || !TRACCAR_PASSWORD) {
-  console.warn(
-    '⚠️ Falta configurar TRACCAR_URL / TRACCAR_USER / TRACCAR_PASSWORD en .env'
-  );
-}
-if (!ORQ_EVENT_URL) {
-  console.warn(
-    'ℹ️ ORQ_EVENT_URL no configurada. Se omiten envios de eventos de Zona Segura.'
-  );
+function cargarVehiculos() {
+  try {
+    if (!fs.existsSync(VEHICULOS_FILE)) {
+      return {};
+    }
+    const raw = fs.readFileSync(VEHICULOS_FILE, 'utf8');
+    if (!raw.trim()) {
+      return {};
+    }
+    return JSON.parse(raw);
+  } catch (err) {
+    console.error('Error cargando vehiculos.json:', err);
+    return {};
+  }
 }
 
-const traccarClient = axios.create({
-  baseURL: TRACCAR_URL,
+function guardarVehiculos(vehiculos) {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(VEHICULOS_FILE, JSON.stringify(vehiculos, null, 2), 'utf8');
+  } catch (err) {
+    console.error('Error guardando vehiculos.json:', err);
+  }
+}
+
+// ---------- Cliente Traccar ----------
+
+const traccar = axios.create({
+  baseURL: process.env.TRACCAR_URL,
   auth: {
-    username: TRACCAR_USER,
-    password: TRACCAR_PASSWORD
-  },
-  headers: {
-    'Content-Type': 'application/json'
+    username: process.env.TRACCAR_USER,
+    password: process.env.TRACCAR_PASSWORD
   },
   timeout: 10000
 });
 
-// Umbral de seguridad para corte remoto
-const CORTE_UMBRAL_KMH = 20;
-
-// ---------------------------
-// Persistencia simple en archivo
-// ---------------------------
-
-let VEHICULOS = {};
-let ESTADO_CORTE = {}; // memoria en runtime
-let ESTADO_ZONA = {}; // estado de zona segura por vehiculo: 'dentro' | 'fuera' | 'fuera_horario' | 'desconocido'
-
-function cargarVehiculos() {
-  try {
-    if (fs.existsSync(VEHICULOS_FILE)) {
-      const raw = fs.readFileSync(VEHICULOS_FILE, 'utf8');
-      VEHICULOS = raw ? JSON.parse(raw) : {};
-    } else {
-      VEHICULOS = {};
-    }
-  } catch (err) {
-    console.error('Error cargando vehiculos.json:', err.message);
-    VEHICULOS = {};
-  }
-}
-
-function guardarVehiculos() {
-  try {
-    fs.writeFileSync(VEHICULOS_FILE, JSON.stringify(VEHICULOS, null, 2), 'utf8');
-  } catch (err) {
-    console.error('Error guardando vehiculos.json:', err.message);
-  }
-}
-
-cargarVehiculos();
-
-// ---------------------------
-// Helpers Traccar
-// ---------------------------
-
-async function getAllDevices() {
-  const resp = await traccarClient.get('/api/devices');
-  return resp.data || [];
-}
-
-async function getDeviceAndPositionByUniqueId(uniqueId) {
-  const devices = await getAllDevices();
-  const device = devices.find((d) => d.uniqueId === uniqueId);
-  if (!device) {
-    throw new Error('Device no encontrado para uniqueId ' + uniqueId);
+// Obtener / crear device en Traccar según uniqueId
+async function asegurarDeviceTraccar(uniqueId, nombre) {
+  const devResp = await traccar.get('/devices', { params: { uniqueId } });
+  const devices = devResp.data;
+  if (Array.isArray(devices) && devices.length > 0) {
+    return devices[0];
   }
 
-  let position = null;
-  if (device.positionId) {
-    const posResp = await traccarClient.get('/api/positions', {
-      params: { id: device.positionId }
-    });
-    if (Array.isArray(posResp.data) && posResp.data.length > 0) {
-      position = posResp.data[0];
-    }
-  }
-
-  return { device, position };
-}
-
-async function crearOActualizarDeviceEnTraccar(uniqueId, name) {
-  const devices = await getAllDevices();
-  let device = devices.find((d) => d.uniqueId === uniqueId);
-
-  if (device) {
-    if (device.name !== name) {
-      const resp = await traccarClient.put(`/api/devices/${device.id}`, {
-        ...device,
-        name
-      });
-      device = resp.data;
-    }
-  } else {
-    const resp = await traccarClient.post('/api/devices', {
-      name,
-      uniqueId
-    });
-    device = resp.data;
-  }
-
-  return device;
-}
-
-async function sendCommandToDevice(uniqueId, type) {
-  const { device } = await getDeviceAndPositionByUniqueId(uniqueId);
-
-  const resp = await traccarClient.post('/api/commands/send', {
-    deviceId: device.id,
-    type
+  const newResp = await traccar.post('/devices', {
+    name: nombre,
+    uniqueId
   });
+  return newResp.data;
+}
+
+// Obtener última posición a partir del deviceId de Traccar
+async function obtenerUltimaPosicionTraccar(deviceId) {
+  const devResp = await traccar.get('/devices', { params: { id: deviceId } });
+  const devices = devResp.data;
+  if (!Array.isArray(devices) || devices.length === 0) {
+    throw new Error('Dispositivo no encontrado en Traccar');
+  }
+  const device = devices[0];
+  if (!device.positionId) {
+    throw new Error('El dispositivo aún no tiene posición en Traccar');
+  }
+
+  const posResp = await traccar.get('/positions', { params: { id: device.positionId } });
+  const positions = posResp.data;
+  if (!Array.isArray(positions) || positions.length === 0) {
+    throw new Error('Posición no encontrada en Traccar');
+  }
+  const pos = positions[0];
+
+  const lat = pos.latitude;
+  const lon = pos.longitude;
+  const velocidadKmh = typeof pos.speed === 'number' ? pos.speed * 1.852 : null;
+  const deviceTime = pos.deviceTime || pos.fixTime || pos.serverTime;
+
+  const dtUtc = deviceTime
+    ? DateTime.fromISO(deviceTime, { zone: 'utc' })
+    : DateTime.utc();
+
+  const dtLocal = dtUtc.setZone(TIMEZONE);
 
   return {
-    device,
-    command: resp.data
+    lat,
+    lon,
+    velocidadKmh,
+    utc: dtUtc.toISO(),
+    local: dtLocal.toISO(),
+    raw: pos
   };
 }
 
-// ---------------------------
-// Helpers varios
-// ---------------------------
+// Enviar comando a Traccar (ej. corte / reanudar)
+async function enviarComandoTraccar(deviceId, tipo, data) {
+  const resp = await traccar.post('/commands/send', {
+    deviceId,
+    type: tipo,
+    attributes: data || {}
+  });
+  return resp.data;
+}
 
-function utcToLocalMx(isoString) {
-  if (!isoString) return null;
-  return DateTime.fromISO(isoString, { zone: 'utc' })
-    .setZone('America/Mexico_City')
-    .toISO();
+// ---------- Utilidades varias ----------
+
+function generarVehiculoId(vehiculos, contratoId, tipoCliente) {
+  if (tipoCliente === 'individual') {
+    return contratoId;
+  }
+  const prefijo = contratoId + '-';
+  let max = 0;
+  for (const id of Object.keys(vehiculos)) {
+    if (id.startsWith(prefijo)) {
+      const suf = id.slice(prefijo.length);
+      const n = parseInt(suf, 10);
+      if (!isNaN(n) && n > max) {
+        max = n;
+      }
+    }
+  }
+  const siguiente = String(max + 1).padStart(3, '0');
+  return prefijo + siguiente;
+}
+
+function googleMapsUrl(lat, lon) {
+  if (typeof lat !== 'number' || typeof lon !== 'number') return null;
+  return `https://www.google.com/maps/search/?api=1&query=${lat},${lon}`;
 }
 
 function distanciaMetros(lat1, lon1, lat2, lon2) {
-  function toRad(g) {
-    return (g * Math.PI) / 180;
-  }
-  const R = 6371000; // metros
+  const R = 6371000;
+  const toRad = (v) => (v * Math.PI) / 180;
   const dLat = toRad(lat2 - lat1);
   const dLon = toRad(lon2 - lon1);
   const a =
@@ -195,906 +162,554 @@ function distanciaMetros(lat1, lon1, lat2, lon2) {
   return R * c;
 }
 
-function horaDentroDeVentana(horaInicio, horaFin, dtLocal) {
-  if (!horaInicio || !horaFin) return true;
-  const [hIni, mIni] = horaInicio.split(':').map(Number);
-  const [hFin, mFin] = horaFin.split(':').map(Number);
-  const minutosActual = dtLocal.hour * 60 + dtLocal.minute;
-  const minutosIni = hIni * 60 + mIni;
-  const minutosFin = hFin * 60 + mFin;
+const MAP_DIA = {
+  LU: 1,
+  MA: 2,
+  MI: 3,
+  JU: 4,
+  VI: 5,
+  SA: 6,
+  DO: 7
+};
 
-  if (Number.isNaN(minutosIni) || Number.isNaN(minutosFin)) return true;
+function horaEnMinutos(hhmm) {
+  const [h, m] = hhmm.split(':').map((x) => parseInt(x, 10));
+  if (isNaN(h) || isNaN(m)) return null;
+  return h * 60 + m;
+}
 
-  if (minutosIni <= minutosFin) {
-    return minutosActual >= minutosIni && minutosActual <= minutosFin;
+function estaEnVentanaHorario(zona, dtLocal) {
+  if (!zona || !zona.diasSemana || !zona.horaInicio || !zona.horaFin) {
+    return false;
   }
-
-  // Cruza medianoche
-  return minutosActual >= minutosIni || minutosActual <= minutosFin;
-}
-
-function codigoDiaSemanaMx(dtLocal) {
-  const dias = ['DO', 'LU', 'MA', 'MI', 'JU', 'VI', 'SA'];
-  const idx = dtLocal.weekday % 7; // 1..7
-  return dias[idx];
-}
-
-function knotsToKmh(knots) {
-  if (typeof knots !== 'number') return null;
-  return knots * 1.852;
-}
-
-// ---------------------------
-// Eventos de Zona Segura
-// ---------------------------
-
-async function enviarEventoSalidaZonaSegura({
-  vehiculoId,
-  config,
-  zona,
-  position,
-  distancia
-}) {
-  if (!ORQ_EVENT_URL) {
-    // No hay URL configurada, solo registramos en logs
-    console.warn(
-      `Evento FUERA_DE_ZONA_SEGURA para ${vehiculoId} (no se envio, ORQ_EVENT_URL vacia)`
-    );
-    return;
+  const diaLuxon = dtLocal.weekday;
+  const dias = zona.diasSemana;
+  const codigosDia = dias.map((d) => MAP_DIA[d]).filter(Boolean);
+  if (!codigosDia.includes(diaLuxon)) {
+    return false;
   }
+  const hm = dtLocal.hour * 60 + dtLocal.minute;
+  const inicio = horaEnMinutos(zona.horaInicio);
+  const fin = horaEnMinutos(zona.horaFin);
+  if (inicio == null || fin == null) return false;
 
-  try {
-    const rawTime =
-      position.serverTime || position.deviceTime || position.fixTime || null;
-    const horaLocal = utcToLocalMx(rawTime);
-    const lat = position.latitude;
-    const lon = position.longitude;
-
-    const googleMapsUrl =
-      lat != null && lon != null
-        ? `https://www.google.com/maps/search/?api=1&query=${lat},${lon}`
-        : null;
-
-    const bodyEvento = {
-      tipoEvento: 'FUERA_DE_ZONA_SEGURA',
-      vehiculoId,
-      contratoId: config.contratoId,
-      uniqueId: config.uniqueId || null,
-      distancia_m: distancia,
-      radio_cliente_m: zona.radio_cliente_m,
-      radio_interno_m: zona.radio_interno_m,
-      lat,
-      lon,
-      hora_evento_utc: rawTime,
-      hora_evento_local: horaLocal,
-      google_maps_url: googleMapsUrl,
-      zonaSegura: {
-        nombre: zona.nombre,
-        diasSemana: zona.diasSemana,
-        horaInicio: zona.horaInicio,
-        horaFin: zona.horaFin
-      }
-    };
-
-    await axios.post(ORQ_EVENT_URL, bodyEvento);
-    console.log(
-      `Evento FUERA_DE_ZONA_SEGURA enviado para vehiculo ${vehiculoId} -> ${ORQ_EVENT_URL}`
-    );
-  } catch (err) {
-    console.error(
-      `Error enviando evento FUERA_DE_ZONA_SEGURA para ${vehiculoId}:`,
-      err.message
-    );
-    if (err.response) {
-      console.error('Status:', err.response.status);
-      console.error('Data:', err.response.data);
-    }
+  if (inicio <= fin) {
+    return hm >= inicio && hm <= fin;
+  } else {
+    return hm >= inicio || hm <= fin;
   }
 }
 
-async function evaluarZonasSegurasYGenerarEventos() {
-  try {
-    const ahoraLocal = DateTime.now().setZone('America/Mexico_City');
-
-    for (const [vehiculoId, config] of Object.entries(VEHICULOS)) {
-      // Debe estar activo y tener zona activa y uniqueId
-      if (config.activo === false) continue;
-      if (!config.uniqueId) continue;
-      const zona = config.zonaSegura;
-      if (!zona || zona.activo !== true) continue;
-
-      // Dia y hora
-      const diaCodigo = codigoDiaSemanaMx(ahoraLocal);
-      const aplicaDia = zona.diasSemana.includes(diaCodigo);
-      const aplicaHora = horaDentroDeVentana(
-        zona.horaInicio,
-        zona.horaFin,
-        ahoraLocal
-      );
-      const aplicaVentana = aplicaDia && aplicaHora;
-
-      let nuevoEstado = 'desconocido';
-      const prevEstado = ESTADO_ZONA[vehiculoId] || 'desconocido';
-
-      if (!aplicaVentana) {
-        nuevoEstado = 'fuera_horario';
-        ESTADO_ZONA[vehiculoId] = nuevoEstado;
-        continue; // no hay evaluacion de distancia ni eventos
-      }
-
-      // Obtener posicion actual
-      let position;
-      try {
-        const res = await getDeviceAndPositionByUniqueId(config.uniqueId);
-        position = res.position;
-        if (!position) {
-          console.warn(
-            `Sin posicion reciente para evaluar Zona Segura en vehiculo ${vehiculoId}`
-          );
-          continue;
-        }
-      } catch (err) {
-        console.error(
-          `Error consultando posicion para Zona Segura en vehiculo ${vehiculoId}:`,
-          err.message
-        );
-        continue;
-      }
-
-      const lat = position.latitude;
-      const lon = position.longitude;
-
-      const dist = distanciaMetros(zona.centro.lat, zona.centro.lon, lat, lon);
-
-      if (dist > zona.radio_interno_m) {
-        nuevoEstado = 'fuera';
-      } else {
-        nuevoEstado = 'dentro';
-      }
-
-      // Guardar nuevo estado
-      ESTADO_ZONA[vehiculoId] = nuevoEstado;
-
-      // Evento: cambio de dentro -> fuera (solo dentro de la ventana)
-      if (nuevoEstado === 'fuera' && prevEstado === 'dentro') {
-        await enviarEventoSalidaZonaSegura({
-          vehiculoId,
-          config,
-          zona,
-          position,
-          distancia: dist
-        });
-      }
-    }
-  } catch (err) {
-    console.error('Error general en evaluarZonasSegurasYGenerarEventos:', err.message);
-  }
-}
-
-// ---------------------------
-// Endpoints
-// ---------------------------
+// ---------- Endpoints básicos ----------
 
 app.get('/api/health', (req, res) => {
-  res.json({ ok: true, mensaje: 'AMA Orquestador vivo' });
+  res.json({
+    ok: true,
+    mensaje: 'AMA Orquestador vivo'
+  });
 });
 
-// ---------------------------
-// 1) Alta de vehiculo
-// ---------------------------
+// ---------- Gestión de vehículos / contratos ----------
 
 app.post('/api/vehiculos', async (req, res) => {
   try {
-    const { contratoId, tipoCliente, nombreTitular, uniqueId, aliasUnidad } =
-      req.body || {};
+    const { contratoId, tipoCliente, nombreTitular, uniqueId, aliasUnidad } = req.body;
 
     if (!contratoId || !tipoCliente || !nombreTitular || !uniqueId) {
       return res.status(400).json({
-        error:
-          'Faltan campos. Se requiere contratoId, tipoCliente, nombreTitular y uniqueId.'
+        error: 'Datos incompletos para alta de vehículo'
       });
     }
 
-    if (!['individual', 'empresa'].includes(tipoCliente)) {
-      return res
-        .status(400)
-        .json({ error: 'tipoCliente debe ser "individual" o "empresa".' });
-    }
+    const vehiculos = cargarVehiculos();
+    const vehiculoId = generarVehiculoId(vehiculos, contratoId, tipoCliente);
 
-    const existenteConUniqueId = Object.entries(VEHICULOS).find(
-      ([, v]) => v.uniqueId === uniqueId
-    );
-    if (existenteConUniqueId) {
-      return res.status(409).json({
-        error:
-          'Ese uniqueId ya esta asignado a otro vehiculo (' +
-          existenteConUniqueId[0] +
-          ').'
-      });
-    }
+    const nombreDevice = aliasUnidad || `Vehículo ${vehiculoId}`;
+    const device = await asegurarDeviceTraccar(uniqueId, nombreDevice);
 
-    const vehiculosContrato = Object.entries(VEHICULOS).filter(
-      ([, v]) => v.contratoId === contratoId
-    );
+    const ahoraIso = new Date().toISOString();
 
-    let vehiculoId;
-    let numeroUnidad;
-
-    if (vehiculosContrato.length === 0) {
-      if (tipoCliente === 'individual') {
-        vehiculoId = contratoId;
-      } else {
-        vehiculoId = contratoId + '-001';
-      }
-      numeroUnidad = 1;
-    } else {
-      const maxNum = vehiculosContrato.reduce(
-        (max, [, v]) =>
-          typeof v.numeroUnidad === 'number' && v.numeroUnidad > max
-            ? v.numeroUnidad
-            : max,
-        1
-      );
-      numeroUnidad = maxNum + 1;
-      const sufijo = String(numeroUnidad).padStart(3, '0');
-      vehiculoId = contratoId + '-' + sufijo;
-    }
-
-    if (VEHICULOS[vehiculoId]) {
-      return res
-        .status(409)
-        .json({ error: 'Ya existe un vehiculo con id ' + vehiculoId });
-    }
-
-    const nombreDevice =
-      contratoId +
-      ' - ' +
-      (aliasUnidad || `Unidad ${numeroUnidad}`) +
-      ' (' +
-      nombreTitular +
-      ')';
-
-    const device = await crearOActualizarDeviceEnTraccar(uniqueId, nombreDevice);
-
-    const ahora = new Date().toISOString();
-
-    VEHICULOS[vehiculoId] = {
+    vehiculos[vehiculoId] = {
+      vehiculoId,
       contratoId,
       tipoCliente,
-      numeroUnidad,
       nombreTitular,
-      aliasUnidad: aliasUnidad || `Unidad ${numeroUnidad}`,
+      aliasUnidad: aliasUnidad || '',
+      nombre_mostrado: aliasUnidad || vehiculoId,
       uniqueId,
+      traccarDeviceId: device.id,
       activo: true,
-      motivoInactivacion: null,
-      fechaAlta: ahora,
-      fechaInactivacion: null,
-      fechaReactivacion: null,
-      fechaCambioUniqueId: null,
-      fechaLiberacionUniqueId: null,
+      motivo_baja: null,
       zonaSegura: null,
-      modoSiniestro: false,
-      siniestro: null
+      siniestro: null,
+      creadoEn: ahoraIso,
+      actualizadoEn: ahoraIso
     };
 
-    ESTADO_CORTE[vehiculoId] = 'normal';
-    ESTADO_ZONA[vehiculoId] = 'desconocido';
-
-    guardarVehiculos();
+    guardarVehiculos(vehiculos);
 
     return res.json({
       ok: true,
       vehiculoId,
       contratoId,
       tipoCliente,
-      numeroUnidad,
       nombreTitular,
-      aliasUnidad: VEHICULOS[vehiculoId].aliasUnidad,
+      aliasUnidad: vehiculos[vehiculoId].aliasUnidad,
+      nombre_mostrado: vehiculos[vehiculoId].nombre_mostrado,
       uniqueId,
-      activo: true,
-      traccarDeviceId: device.id,
-      mensaje: 'Vehiculo registrado en el Orquestador y en Traccar.'
+      traccarDeviceId: device.id
     });
   } catch (err) {
-    console.error('Error en POST /api/vehiculos:', err.message);
-    if (err.response) {
-      console.error('Status:', err.response.status);
-      console.error('Data:', err.response.data);
-    }
+    console.error('Error en alta de vehiculo:', err);
     return res.status(500).json({
       error: 'No se pudo registrar el vehiculo',
-      detalle: err.response ? `${err.response.status}` : err.message
+      detalle: err.response?.status || err.message
     });
   }
 });
-
-// ---------------------------
-// 2) Inactivar vehiculo
-// ---------------------------
 
 app.post('/api/vehiculos/:vehiculoId/inactivar', (req, res) => {
-  const vehiculoId = req.params.vehiculoId;
-  const config = VEHICULOS[vehiculoId];
+  const { vehiculoId } = req.params;
+  const { motivo } = req.body;
+  const vehiculos = cargarVehiculos();
+  const vehiculo = vehiculos[vehiculoId];
 
-  if (!config) {
-    return res
-      .status(404)
-      .json({ error: 'Vehiculo no configurado en el Orquestador' });
+  if (!vehiculo) {
+    return res.status(404).json({ error: 'Vehiculo no encontrado en el Orquestador' });
   }
 
-  const { motivo } = req.body || {};
+  vehiculo.activo = false;
+  vehiculo.motivo_baja = motivo || 'sin_especificar';
+  vehiculo.actualizadoEn = new Date().toISOString();
 
-  if (!['impago', 'cancelacion'].includes(motivo)) {
-    return res
-      .status(400)
-      .json({ error: 'motivo debe ser "impago" o "cancelacion".' });
-  }
-
-  const yaEstabaInactivo = config.activo === false;
-  config.activo = false;
-  config.motivoInactivacion = motivo;
-  config.fechaInactivacion = new Date().toISOString();
-
-  guardarVehiculos();
+  guardarVehiculos(vehiculos);
 
   return res.json({
     ok: true,
     vehiculoId,
-    contratoId: config.contratoId,
-    activo: false,
-    motivoInactivacion: motivo,
-    yaEstabaInactivo,
-    mensaje:
-      'Vehiculo inactivado por motivo "' +
-      motivo +
-      '". No se realizaran mas operaciones hasta reactivacion.'
+    activo: vehiculo.activo,
+    motivo_baja: vehiculo.motivo_baja
   });
 });
-
-// ---------------------------
-// 3) Reactivar vehiculo
-// ---------------------------
 
 app.post('/api/vehiculos/:vehiculoId/reactivar', (req, res) => {
-  const vehiculoId = req.params.vehiculoId;
-  const config = VEHICULOS[vehiculoId];
+  const { vehiculoId } = req.params;
+  const vehiculos = cargarVehiculos();
+  const vehiculo = vehiculos[vehiculoId];
 
-  if (!config) {
-    return res
-      .status(404)
-      .json({ error: 'Vehiculo no configurado en el Orquestador' });
+  if (!vehiculo) {
+    return res.status(404).json({ error: 'Vehiculo no encontrado en el Orquestador' });
   }
 
-  if (!config.uniqueId) {
-    return res.status(409).json({
-      error:
-        'El vehiculo no tiene un dispositivo (uniqueId) asignado. Asigna un dispositivo antes de reactivar.'
-    });
-  }
+  vehiculo.activo = true;
+  vehiculo.motivo_baja = null;
+  vehiculo.actualizadoEn = new Date().toISOString();
 
-  if (config.activo !== false) {
-    return res.json({
-      ok: false,
-      vehiculoId,
-      contratoId: config.contratoId,
-      activo: true,
-      mensaje: 'El vehiculo ya se encontraba activo.'
-    });
-  }
-
-  config.activo = true;
-  config.motivoInactivacion = null;
-  config.fechaReactivacion = new Date().toISOString();
-
-  guardarVehiculos();
+  guardarVehiculos(vehiculos);
 
   return res.json({
     ok: true,
     vehiculoId,
-    contratoId: config.contratoId,
-    activo: true,
-    mensaje:
-      'Vehiculo reactivado. Se reanuda el monitoreo y el uso de funciones de seguridad.'
+    activo: vehiculo.activo
   });
 });
-
-// ---------------------------
-// 4) Cambiar equipo (modificar uniqueId)
-// ---------------------------
 
 app.post('/api/vehiculos/:vehiculoId/modificar-uniqueId', async (req, res) => {
   try {
-    const vehiculoId = req.params.vehiculoId;
-    const config = VEHICULOS[vehiculoId];
+    const { vehiculoId } = req.params;
+    const { nuevoUniqueId } = req.body;
 
-    if (!config) {
-      return res
-        .status(404)
-        .json({ error: 'Vehiculo no configurado en el Orquestador' });
+    if (!nuevoUniqueId) {
+      return res.status(400).json({ error: 'nuevoUniqueId es obligatorio' });
     }
 
-    const { nuevoUniqueId } = req.body || {};
-    if (!nuevoUniqueId || typeof nuevoUniqueId !== 'string') {
-      return res
-        .status(400)
-        .json({ error: 'nuevoUniqueId es obligatorio y debe ser un string.' });
+    const vehiculos = cargarVehiculos();
+    const vehiculo = vehiculos[vehiculoId];
+
+    if (!vehiculo) {
+      return res.status(404).json({ error: 'Vehiculo no encontrado en el Orquestador' });
     }
 
-    if (!config.uniqueId) {
-      return res.status(409).json({
-        error:
-          'El vehiculo no tiene uniqueId actual asignado. Revisa el estado o usa el flujo de alta.'
-      });
+    const deviceId = vehiculo.traccarDeviceId;
+    if (!deviceId) {
+      return res.status(409).json({ error: 'Vehiculo sin traccarDeviceId' });
     }
 
-    const otro = Object.entries(VEHICULOS).find(
-      ([id, v]) => v.uniqueId === nuevoUniqueId && id !== vehiculoId
-    );
-    if (otro) {
-      return res.status(409).json({
-        error:
-          'El nuevo uniqueId ya esta asignado al vehiculo ' +
-          otro[0] +
-          '.'
-      });
-    }
+    await traccar.put(`/devices/${deviceId}`, {
+      id: deviceId,
+      name: vehiculo.nombre_mostrado,
+      uniqueId: nuevoUniqueId
+    });
 
-    const nombreDevice =
-      config.contratoId +
-      ' - ' +
-      (config.aliasUnidad || `Unidad ${config.numeroUnidad}`) +
-      ' (' +
-      config.nombreTitular +
-      ')';
+    vehiculo.uniqueId = nuevoUniqueId;
+    vehiculo.actualizadoEn = new Date().toISOString();
 
-    const device = await crearOActualizarDeviceEnTraccar(
-      nuevoUniqueId,
-      nombreDevice
-    );
-
-    const uniqueIdAnterior = config.uniqueId;
-    config.uniqueId = nuevoUniqueId;
-    config.fechaCambioUniqueId = new Date().toISOString();
-
-    guardarVehiculos();
+    guardarVehiculos(vehiculos);
 
     return res.json({
       ok: true,
       vehiculoId,
-      contratoId: config.contratoId,
-      uniqueIdAnterior,
-      nuevoUniqueId,
-      traccarDeviceId: device.id,
-      mensaje:
-        'uniqueId actualizado correctamente. El nuevo dispositivo queda asociado a este vehiculo.'
+      uniqueId: vehiculo.uniqueId
     });
   } catch (err) {
-    console.error(
-      'Error en POST /api/vehiculos/:vehiculoId/modificar-uniqueId:',
-      err.message
-    );
-    if (err.response) {
-      console.error('Status:', err.response.status);
-      console.error('Data:', err.response.data);
-    }
+    console.error('Error modificando uniqueId:', err);
     return res.status(500).json({
-      error: 'No se pudo modificar el uniqueId del vehiculo',
-      detalle: err.response ? `${err.response.status}` : err.message
+      error: 'No se pudo modificar el uniqueId',
+      detalle: err.response?.status || err.message
     });
   }
 });
 
-// ---------------------------
-// 5) Reutilizar equipo (liberar uniqueId)
-// ---------------------------
+app.post('/api/vehiculos/:vehiculoId/liberar-dispositivo', async (req, res) => {
+  try {
+    const { vehiculoId } = req.params;
+    const vehiculos = cargarVehiculos();
+    const vehiculo = vehiculos[vehiculoId];
 
-app.post('/api/vehiculos/:vehiculoId/liberar-dispositivo', (req, res) => {
-  const vehiculoId = req.params.vehiculoId;
-  const config = VEHICULOS[vehiculoId];
+    if (!vehiculo) {
+      return res.status(404).json({ error: 'Vehiculo no encontrado en el Orquestador' });
+    }
 
-  if (!config) {
-    return res
-      .status(404)
-      .json({ error: 'Vehiculo no configurado en el Orquestador' });
-  }
+    vehiculo.activo = false;
+    vehiculo.motivo_baja = 'liberado_para_reutilizar';
+    vehiculo.actualizadoEn = new Date().toISOString();
 
-  if (config.activo !== false) {
-    return res.status(409).json({
-      error:
-        'Solo puedes liberar el dispositivo de un vehiculo inactivo. Inactivalo primero.'
+    guardarVehiculos(vehiculos);
+
+    return res.json({
+      ok: true,
+      vehiculoId,
+      mensaje: 'Vehiculo marcado como liberado; el dispositivo puede reutilizarse'
+    });
+  } catch (err) {
+    console.error('Error liberando dispositivo:', err);
+    return res.status(500).json({
+      error: 'No se pudo liberar el dispositivo',
+      detalle: err.message
     });
   }
-
-  if (!config.uniqueId) {
-    return res.status(409).json({
-      error:
-        'El vehiculo no tiene uniqueId asignado actualmente. No hay dispositivo que liberar.'
-    });
-  }
-
-  const uniqueIdLiberado = config.uniqueId;
-  config.uniqueId = null;
-  config.fechaLiberacionUniqueId = new Date().toISOString();
-
-  guardarVehiculos();
-
-  return res.json({
-    ok: true,
-    vehiculoId,
-    contratoId: config.contratoId,
-    activo: false,
-    uniqueIdLiberado,
-    mensaje:
-      'Dispositivo liberado. El uniqueId puede asignarse a otro cliente mediante el proceso de alta de vehiculo.'
-  });
 });
-
-// ---------------------------
-// 6) Consultar estatus del vehiculo
-// ---------------------------
 
 app.get('/api/vehiculos/:vehiculoId/estatus', async (req, res) => {
   try {
-    const vehiculoId = req.params.vehiculoId;
-    const config = VEHICULOS[vehiculoId];
+    const { vehiculoId } = req.params;
+    const vehiculos = cargarVehiculos();
+    const vehiculo = vehiculos[vehiculoId];
 
-    if (!config) {
-      return res
-        .status(404)
-        .json({ error: 'Vehiculo no configurado en el Orquestador' });
+    if (!vehiculo) {
+      return res.status(404).json({ error: 'Vehiculo no configurado en el Orquestador' });
     }
 
-    const base = {
-      vehiculoId,
-      contratoId: config.contratoId,
-      tipoCliente: config.tipoCliente,
-      nombreTitular: config.nombreTitular,
-      aliasUnidad: config.aliasUnidad || null,
-      activo_orq: config.activo !== false,
-      motivoInactivacion: config.motivoInactivacion || null,
-      estado_corte: ESTADO_CORTE[vehiculoId] || 'desconocido',
-      tiene_zona_segura: !!config.zonaSegura,
-      zona_segura_activa: config.zonaSegura?.activo === true,
-      modo_siniestro: config.modoSiniestro === true,
-      hora_inicio_siniestro: config.siniestro?.horaInicio || null,
-      hora_cierre_siniestro: config.siniestro?.horaCierre || null,
-      resultado_siniestro: config.siniestro?.resultado || null
-    };
+    let existeEnTraccar = false;
+    let statusTraccar = 'desconocido';
 
-    if (!config.uniqueId) {
-      return res.json({
-        ...base,
-        tiene_uniqueId: false,
-        uniqueId: null,
-        existe_en_traccar: false,
-        status_traccar: null,
-        activo_traccar: null,
-        ultima_comunicacion_utc: null,
-        ultima_comunicacion_local: null
-      });
+    if (vehiculo.traccarDeviceId) {
+      try {
+        const devResp = await traccar.get('/devices', { params: { id: vehiculo.traccarDeviceId } });
+        const devices = devResp.data;
+        if (Array.isArray(devices) && devices.length > 0) {
+          existeEnTraccar = true;
+          const dev = devices[0];
+          statusTraccar = dev.status || 'desconocido';
+        }
+      } catch (innerErr) {
+        console.error('Error consultando estatus en Traccar:', innerErr.message);
+      }
     }
-
-    const devices = await getAllDevices();
-    const device = devices.find((d) => d.uniqueId === config.uniqueId);
-
-    if (!device) {
-      return res.json({
-        ...base,
-        tiene_uniqueId: true,
-        uniqueId: config.uniqueId,
-        existe_en_traccar: false,
-        status_traccar: null,
-        activo_traccar: null,
-        ultima_comunicacion_utc: null,
-        ultima_comunicacion_local: null
-      });
-    }
-
-    const statusTraccar = device.status || 'desconocido';
-    const activoTraccar = statusTraccar === 'online';
-    const lastUpdateUtc = device.lastUpdate || null;
-    const lastUpdateLocal = utcToLocalMx(lastUpdateUtc);
 
     return res.json({
-      ...base,
-      tiene_uniqueId: true,
-      uniqueId: config.uniqueId,
-      existe_en_traccar: true,
-      status_traccar: statusTraccar,
-      activo_traccar: activoTraccar,
-      ultima_comunicacion_utc: lastUpdateUtc,
-      ultima_comunicacion_local: lastUpdateLocal
+      vehiculoId,
+      contratoId: vehiculo.contratoId,
+      nombre_mostrado: vehiculo.nombre_mostrado,
+      activo_orq: vehiculo.activo,
+      motivo_baja: vehiculo.motivo_baja,
+      existe_en_traccar: existeEnTraccar,
+      status_traccar: statusTraccar
     });
   } catch (err) {
-    console.error('Error en GET /api/vehiculos/:vehiculoId/estatus:', err.message);
-    if (err.response) {
-      console.error('Status:', err.response.status);
-      console.error('Data:', err.response.data);
-    }
+    console.error('Error en estatus de vehiculo:', err);
     return res.status(500).json({
-      error: 'Error consultando estatus en Traccar',
-      detalle: err.response ? `${err.response.status}` : err.message
+      error: 'Error consultando estatus',
+      detalle: err.message
     });
   }
 });
 
-// ---------------------------
-// 7) Ubicacion del vehiculo
-// ---------------------------
+// ---------- Ubicación y corte remoto ----------
 
 app.get('/api/vehiculos/:vehiculoId/ubicacion', async (req, res) => {
   try {
-    const vehiculoId = req.params.vehiculoId;
-    const config = VEHICULOS[vehiculoId];
+    const { vehiculoId } = req.params;
+    const vehiculos = cargarVehiculos();
+    const vehiculo = vehiculos[vehiculoId];
 
-    if (!config) {
-      return res
-        .status(404)
-        .json({ error: 'Vehiculo no configurado en el Orquestador' });
+    if (!vehiculo) {
+      return res.status(404).json({ error: 'Vehiculo no configurado en el Orquestador' });
     }
 
-    if (config.activo === false) {
-      return res.status(409).json({
-        error: 'Vehiculo inactivo; no se puede consultar ubicacion.',
-        motivo_inactivacion: config.motivoInactivacion || null
-      });
+    if (!vehiculo.activo) {
+      return res.status(409).json({ error: 'Vehiculo inactivo en el Orquestador' });
     }
 
-    if (!config.uniqueId) {
-      return res.status(409).json({
-        error:
-          'El vehiculo no tiene uniqueId asignado. No se puede consultar ubicacion.'
-      });
+    if (!vehiculo.traccarDeviceId) {
+      return res.status(409).json({ error: 'Vehiculo sin traccarDeviceId' });
     }
 
-    const { device, position } = await getDeviceAndPositionByUniqueId(
-      config.uniqueId
-    );
-
-    const estado = device.status || 'desconocido';
-
-    const rawTime =
-      (position && (position.serverTime || position.deviceTime || position.fixTime)) ||
-      null;
-
-    const horaLocal = utcToLocalMx(rawTime);
-
-    const lat = position ? position.latitude : null;
-    const lon = position ? position.longitude : null;
-
-    const googleMapsUrl =
-      lat != null && lon != null
-        ? `https://www.google.com/maps/search/?api=1&query=${lat},${lon}`
-        : null;
-
-    const fuentePosicion =
-      (position && position.attributes && position.attributes.source) || null;
-    const precision =
-      position && typeof position.accuracy === 'number'
-        ? position.accuracy
-        : null;
-    const satelites =
-      position && position.attributes && typeof position.attributes.sat === 'number'
-        ? position.attributes.sat
-        : null;
-
-    const velocidadKmh =
-      position && typeof position.speed === 'number'
-        ? knotsToKmh(position.speed)
-        : null;
+    const pos = await obtenerUltimaPosicionTraccar(vehiculo.traccarDeviceId);
 
     return res.json({
       vehiculoId,
-      contratoId: config.contratoId,
-      nombre_mostrado: config.aliasUnidad || config.nombreTitular,
-      estado,
-      lat,
-      lon,
-      hora_ultima_posicion_utc: rawTime,
-      hora_ultima_posicion_local: horaLocal,
-      google_maps_url: googleMapsUrl,
-      fuente_posicion: fuentePosicion,
-      precision_aprox_m: precision,
-      satelites,
-      velocidad_kmh: velocidadKmh
+      contratoId: vehiculo.contratoId,
+      nombre_mostrado: vehiculo.nombre_mostrado,
+      estado: 'online',
+      lat: pos.lat,
+      lon: pos.lon,
+      hora_ultima_posicion_utc: pos.utc,
+      hora_ultima_posicion_local: pos.local,
+      google_maps_url: googleMapsUrl(pos.lat, pos.lon),
+      fuente_posicion: null,
+      precision_aprox_m: 0,
+      satelites: null,
+      velocidad_kmh: pos.velocidadKmh
     });
   } catch (err) {
-    console.error('Error en GET /api/vehiculos/:vehiculoId/ubicacion:', err.message);
-    if (err.response) {
-      console.error('Status:', err.response.status);
-      console.error('Data:', err.response.data);
-    }
+    console.error('Error obteniendo ubicacion:', err);
     return res.status(500).json({
-      error: 'Error consultando Traccar',
-      detalle: err.response ? `${err.response.status}` : err.message
+      error: 'Error consultando ubicacion',
+      detalle: err.message
     });
   }
 });
 
-// ---------------------------
-// 8) Estado de corte
-// ---------------------------
-
 app.get('/api/vehiculos/:vehiculoId/estado-corte', (req, res) => {
-  const vehiculoId = req.params.vehiculoId;
-  const config = VEHICULOS[vehiculoId];
+  const { vehiculoId } = req.params;
+  const vehiculos = cargarVehiculos();
+  const vehiculo = vehiculos[vehiculoId];
 
-  if (!config) {
-    return res
-      .status(404)
-      .json({ error: 'Vehiculo no configurado en el Orquestador' });
+  if (!vehiculo) {
+    return res.status(404).json({ error: 'Vehiculo no configurado en el Orquestador' });
   }
 
-  const estadoCorte = ESTADO_CORTE[vehiculoId] || 'normal';
+  const estado = vehiculo.estado_corte || 'normal';
 
   return res.json({
     vehiculoId,
-    contratoId: config.contratoId,
-    estado_corte: estadoCorte
+    contratoId: vehiculo.contratoId,
+    estado_corte: estado
   });
 });
 
-// ---------------------------
-// 9) Corte y reanudacion de motor
-// ---------------------------
-
 app.post('/api/vehiculos/:vehiculoId/corte', async (req, res) => {
   try {
-    const vehiculoId = req.params.vehiculoId;
-    const config = VEHICULOS[vehiculoId];
+    const { vehiculoId } = req.params;
+    const vehiculos = cargarVehiculos();
+    const vehiculo = vehiculos[vehiculoId];
 
-    if (!config) {
-      return res
-        .status(404)
-        .json({ error: 'Vehiculo no configurado en el Orquestador' });
+    if (!vehiculo) {
+      return res.status(404).json({ error: 'Vehiculo no configurado en el Orquestador' });
     }
 
-    if (config.activo === false) {
-      return res.status(409).json({
-        error: 'Vehiculo inactivo; no se puede enviar comando de corte.',
-        motivo_inactivacion: config.motivoInactivacion || null
-      });
+    if (!vehiculo.activo) {
+      return res.status(409).json({ error: 'Vehiculo inactivo en el Orquestador' });
     }
 
-    if (!config.uniqueId) {
-      return res.status(409).json({
-        error:
-          'El vehiculo no tiene uniqueId asignado. No se puede enviar comando de corte.'
-      });
+    if (!vehiculo.traccarDeviceId) {
+      return res.status(409).json({ error: 'Vehiculo sin traccarDeviceId' });
     }
 
-    // 1) Intentar obtener velocidad actual
-    let velocidadKmh = null;
-    try {
-      const { position } = await getDeviceAndPositionByUniqueId(config.uniqueId);
-      if (position && typeof position.speed === 'number') {
-        velocidadKmh = knotsToKmh(position.speed);
-      }
-    } catch (e) {
-      console.error('Error obteniendo velocidad antes de corte:', e.message);
-      // No rompemos el flujo; seguimos mandando el comando sin velocidad
-    }
+    const pos = await obtenerUltimaPosicionTraccar(vehiculo.traccarDeviceId);
+    const velocidad = pos.velocidadKmh || 0;
+    const cortePuedeDemorar = velocidad > 20;
 
-    // 2) Enviar comando de corte
-    const { command } = await sendCommandToDevice(config.uniqueId, 'engineStop');
-    ESTADO_CORTE[vehiculoId] = 'cortado';
+    await enviarComandoTraccar(vehiculo.traccarDeviceId, 'engineStop', {});
 
-    const superaUmbral =
-      velocidadKmh != null && velocidadKmh > CORTE_UMBRAL_KMH;
-
-    const mensaje = superaUmbral
-      ? `Comando de corte enviado. El dispositivo ejecutara el paro cuando la velocidad sea menor o igual a ${CORTE_UMBRAL_KMH} km/h.`
-      : 'Comando de corte enviado y aceptado por el servidor. El dispositivo debe ejecutar el paro en segundos.';
+    vehiculo.estado_corte = 'cortado';
+    vehiculo.actualizadoEn = new Date().toISOString();
+    guardarVehiculos(vehiculos);
 
     return res.json({
+      ok: true,
       vehiculoId,
-      contratoId: config.contratoId,
-      resultado: 'confirmado',
-      comandoId: command.id,
-      estado_corte: 'cortado',
-      velocidad_kmh: velocidadKmh,
-      corte_puede_demorar: superaUmbral,
-      mensaje
+      contratoId: vehiculo.contratoId,
+      resultado: 'comando_enviado',
+      estado_corte: vehiculo.estado_corte,
+      velocidad_kmh: velocidad,
+      corte_puede_demorar: cortePuedeDemorar
     });
   } catch (err) {
-    console.error('Error en POST /api/vehiculos/:vehiculoId/corte:', err.message);
-    if (err.response) {
-      console.error('Status:', err.response.status);
-      console.error('Data:', err.response.data);
-    }
+    console.error('Error enviando corte:', err);
     return res.status(500).json({
       error: 'No se pudo enviar el comando de corte',
-      detalle: err.response ? `${err.response.status}` : err.message
+      detalle: err.message
     });
   }
 });
 
 app.post('/api/vehiculos/:vehiculoId/reanudar', async (req, res) => {
   try {
-    const vehiculoId = req.params.vehiculoId;
-    const config = VEHICULOS[vehiculoId];
+    const { vehiculoId } = req.params;
+    const vehiculos = cargarVehiculos();
+    const vehiculo = vehiculos[vehiculoId];
 
-    if (!config) {
-      return res
-        .status(404)
-        .json({ error: 'Vehiculo no configurado en el Orquestador' });
+    if (!vehiculo) {
+      return res.status(404).json({ error: 'Vehiculo no configurado en el Orquestador' });
     }
 
-    if (config.activo === false) {
-      return res.status(409).json({
-        error: 'Vehiculo inactivo; no se puede enviar comando de reanudacion.',
-        motivo_inactivacion: config.motivoInactivacion || null
-      });
+    if (!vehiculo.traccarDeviceId) {
+      return res.status(409).json({ error: 'Vehiculo sin traccarDeviceId' });
     }
 
-    if (!config.uniqueId) {
-      return res.status(409).json({
-        error:
-          'El vehiculo no tiene uniqueId asignado. No se puede enviar comando de reanudacion.'
-      });
-    }
+    await enviarComandoTraccar(vehiculo.traccarDeviceId, 'engineResume', {});
 
-    const { command } = await sendCommandToDevice(
-      config.uniqueId,
-      'engineResume'
-    );
-    ESTADO_CORTE[vehiculoId] = 'normal';
+    vehiculo.estado_corte = 'normal';
+    vehiculo.actualizadoEn = new Date().toISOString();
+    guardarVehiculos(vehiculos);
 
     return res.json({
+      ok: true,
       vehiculoId,
-      contratoId: config.contratoId,
-      resultado: 'confirmado',
-      comandoId: command.id,
-      estado_corte: 'normal',
-      mensaje:
-        'Comando de reanudacion enviado y aceptado por el servidor. El dispositivo debe restablecer la marcha en segundos.'
+      contratoId: vehiculo.contratoId,
+      estado_corte: vehiculo.estado_corte
     });
   } catch (err) {
-    console.error(
-      'Error en POST /api/vehiculos/:vehiculoId/reanudar:',
-      err.message
-    );
-    if (err.response) {
-      console.error('Status:', err.response.status);
-      console.error('Data:', err.response.data);
-    }
+    console.error('Error enviando reanudacion:', err);
     return res.status(500).json({
-      error: 'No se pudo enviar el comando de reanudacion',
-      detalle: err.response ? `${err.response.status}` : err.message
+      error: 'No se pudo enviar el comando de reanudación',
+      detalle: err.message
     });
   }
 });
 
-// ---------------------------
-// 10) Zona Segura
-// ---------------------------
+// ---------- Protocolo de siniestro ----------
 
-// Configurar / activar Zona Segura (Z1 / Z3)
+app.post('/api/vehiculos/:vehiculoId/siniestro/iniciar', async (req, res) => {
+  try {
+    const { vehiculoId } = req.params;
+    const { causa, canal, detalle } = req.body;
+    const vehiculos = cargarVehiculos();
+    const vehiculo = vehiculos[vehiculoId];
+
+    if (!vehiculo) {
+      return res.status(404).json({ error: 'Vehiculo no configurado en el Orquestador' });
+    }
+
+    if (!vehiculo.activo) {
+      return res.status(409).json({ error: 'Vehiculo inactivo en el Orquestador' });
+    }
+
+    vehiculo.siniestro = {
+      activo: true,
+      causa: causa || null,
+      canal: canal || null,
+      detalle: detalle || null,
+      iniciadoEn: new Date().toISOString(),
+      cerradoEn: null,
+      resultado: null
+    };
+    vehiculo.actualizadoEn = new Date().toISOString();
+
+    guardarVehiculos(vehiculos);
+
+    let ubicacion = null;
+    if (vehiculo.traccarDeviceId) {
+      try {
+        const pos = await obtenerUltimaPosicionTraccar(vehiculo.traccarDeviceId);
+        ubicacion = {
+          lat: pos.lat,
+          lon: pos.lon,
+          hora_ultima_posicion_local: pos.local,
+          google_maps_url: googleMapsUrl(pos.lat, pos.lon),
+          velocidad_kmh: pos.velocidadKmh
+        };
+      } catch (inner) {
+        console.error('Error obteniendo ubicacion al iniciar siniestro:', inner.message);
+      }
+    }
+
+    return res.json({
+      ok: true,
+      vehiculoId,
+      contratoId: vehiculo.contratoId,
+      siniestro: vehiculo.siniestro,
+      ubicacion
+    });
+  } catch (err) {
+    console.error('Error iniciando siniestro:', err);
+    return res.status(500).json({
+      error: 'Error iniciando siniestro',
+      detalle: err.message
+    });
+  }
+});
+
+app.post('/api/vehiculos/:vehiculoId/siniestro/cerrar', async (req, res) => {
+  try {
+    const { vehiculoId } = req.params;
+    const { resultado, reanudarMotor } = req.body;
+    const vehiculos = cargarVehiculos();
+    const vehiculo = vehiculos[vehiculoId];
+
+    if (!vehiculo) {
+      return res.status(404).json({ error: 'Vehiculo no configurado en el Orquestador' });
+    }
+
+    if (!vehiculo.siniestro || !vehiculo.siniestro.activo) {
+      return res.status(409).json({ error: 'No hay siniestro activo para este vehículo' });
+    }
+
+    vehiculo.siniestro.activo = false;
+    vehiculo.siniestro.resultado = resultado || null;
+    vehiculo.siniestro.cerradoEn = new Date().toISOString();
+
+    let ubicacion = null;
+    if (vehiculo.traccarDeviceId) {
+      try {
+        const pos = await obtenerUltimaPosicionTraccar(vehiculo.traccarDeviceId);
+        ubicacion = {
+          lat: pos.lat,
+          lon: pos.lon,
+          hora_ultima_posicion_local: pos.local,
+          google_maps_url: googleMapsUrl(pos.lat, pos.lon),
+          velocidad_kmh: pos.velocidadKmh
+        };
+      } catch (inner) {
+        console.error('Error obteniendo ubicacion al cerrar siniestro:', inner.message);
+      }
+    }
+
+    if (reanudarMotor && vehiculo.traccarDeviceId) {
+      try {
+        await enviarComandoTraccar(vehiculo.traccarDeviceId, 'engineResume', {});
+        vehiculo.estado_corte = 'normal';
+      } catch (inner) {
+        console.error('Error reanudando motor al cerrar siniestro:', inner.message);
+      }
+    }
+
+    vehiculo.actualizadoEn = new Date().toISOString();
+    guardarVehiculos(vehiculos);
+
+    return res.json({
+      ok: true,
+      vehiculoId,
+      contratoId: vehiculo.contratoId,
+      siniestro: vehiculo.siniestro,
+      ubicacion
+    });
+  } catch (err) {
+    console.error('Error cerrando siniestro:', err);
+    return res.status(500).json({
+      error: 'Error cerrando siniestro',
+      detalle: err.message
+    });
+  }
+});
+
+// ---------- Zona Segura ----------
+
 app.post('/api/vehiculos/:vehiculoId/zona-segura', async (req, res) => {
   try {
-    const vehiculoId = req.params.vehiculoId;
-    const config = VEHICULOS[vehiculoId];
-
-    if (!config) {
-      return res
-        .status(404)
-        .json({ error: 'Vehiculo no configurado en el Orquestador' });
-    }
-
-    if (config.activo === false) {
-      return res.status(409).json({
-        error: 'Vehiculo inactivo; no se puede configurar Zona Segura.',
-        motivo_inactivacion: config.motivoInactivacion || null
-      });
-    }
-
-    if (!config.uniqueId) {
-      return res.status(409).json({
-        error:
-          'El vehiculo no tiene uniqueId asignado. No se puede configurar Zona Segura.'
-      });
-    }
-
+    const { vehiculoId } = req.params;
     const {
       nombre,
       limite_m,
@@ -1103,195 +718,145 @@ app.post('/api/vehiculos/:vehiculoId/zona-segura', async (req, res) => {
       horaFin,
       activo,
       forzarSobreEscritura
-    } = req.body || {};
+    } = req.body;
 
-    if (!nombre || typeof nombre !== 'string') {
-      return res
-        .status(400)
-        .json({ error: 'nombre es obligatorio y debe ser string.' });
+    const vehiculos = cargarVehiculos();
+    const vehiculo = vehiculos[vehiculoId];
+
+    if (!vehiculo) {
+      return res.status(404).json({ error: 'Vehiculo no configurado en el Orquestador' });
     }
 
-    if (typeof limite_m !== 'number') {
-      return res
-        .status(400)
-        .json({ error: 'limite_m es obligatorio y debe ser numero.' });
-    }
-
-    if (limite_m < 20 || limite_m > 40) {
+    const limite = parseInt(limite_m, 10);
+    if (isNaN(limite) || limite < 20 || limite > 40) {
       return res.status(400).json({
-        error: 'limite_m debe estar entre 20 y 40 metros.'
+        error: 'limite_m inválido; debe estar entre 20 y 40 metros'
       });
     }
 
     if (!Array.isArray(diasAccion) || diasAccion.length === 0) {
       return res.status(400).json({
-        error:
-          'diasAccion debe ser un arreglo no vacio con codigos tipo "LU","MA","MI","JU","VI","SA","DO".'
+        error: 'diasAccion debe ser un arreglo no vacío',
+        detalle: 'Ej: ["LU","MA","MI","JU","VI"]'
       });
     }
 
-    const diasValidos = new Set(['LU', 'MA', 'MI', 'JU', 'VI', 'SA', 'DO']);
-    const diasInvalidos = diasAccion.filter((d) => !diasValidos.has(d));
-    if (diasInvalidos.length > 0) {
-      return res.status(400).json({
-        error:
-          'diasAccion contiene valores invalidos: ' + diasInvalidos.join(', ')
-      });
-    }
-
-    if (!horaInicio || typeof horaInicio !== 'string') {
-      return res
-        .status(400)
-        .json({ error: 'horaInicio es obligatoria y debe ser string HH:mm.' });
-    }
-
-    if (!horaFin || typeof horaFin !== 'string') {
-      return res
-        .status(400)
-        .json({ error: 'horaFin es obligatoria y debe ser string HH:mm.' });
-    }
-
-    if (typeof activo !== 'boolean') {
-      return res
-        .status(400)
-        .json({ error: 'activo es obligatorio y debe ser boolean.' });
-    }
-
-    const zonaActual = config.zonaSegura;
-    const zonaActivaYa = zonaActual && zonaActual.activo === true;
-
-    if (zonaActivaYa && !forzarSobreEscritura) {
-      return res.json({
-        ok: false,
-        vehiculoId,
-        contratoId: config.contratoId,
-        yaExistiaActiva: true,
-        requiere_confirmacion: true,
-        zona_actual: {
-          nombre: zonaActual.nombre,
-          radio_cliente_m: zonaActual.radio_cliente_m,
-          diasSemana: zonaActual.diasSemana,
-          horaInicio: zonaActual.horaInicio,
-          horaFin: zonaActual.horaFin,
-          activo: zonaActual.activo
-        },
-        mensaje:
-          'Ya existe una Zona Segura activa. El usuario debe decidir si la mantiene o la reemplaza.'
-      });
-    }
-
-    // Obtener posicion actual del vehiculo
-    let latCentro = null;
-    let lonCentro = null;
-
-    try {
-      const { position } = await getDeviceAndPositionByUniqueId(config.uniqueId);
-      if (!position) {
-        return res.status(500).json({
-          error:
-            'No se encontro posicion reciente del vehiculo para configurar Zona Segura. Intenta de nuevo cuando el equipo tenga señal.'
+    const diasValidos = ['LU', 'MA', 'MI', 'JU', 'VI', 'SA', 'DO'];
+    for (const d of diasAccion) {
+      if (!diasValidos.includes(d)) {
+        return res.status(400).json({
+          error: `Dia inválido en diasAccion: ${d}`
         });
       }
-      latCentro = position.latitude;
-      lonCentro = position.longitude;
-    } catch (e) {
-      console.error('Error obteniendo posicion para Zona Segura:', e.message);
-      return res.status(500).json({
-        error:
-          'Error consultando posicion actual del vehiculo para configurar Zona Segura.',
-        detalle: e.message
+    }
+
+    if (!horaInicio || !horaFin) {
+      return res.status(400).json({ error: 'horaInicio y horaFin son obligatorias' });
+    }
+
+    if (vehiculo.zonaSegura && !forzarSobreEscritura) {
+      return res.status(409).json({
+        error: 'Zona Segura ya configurada',
+        detalle: 'Envía forzarSobreEscritura=true para reemplazarla'
       });
     }
 
-    const radioCliente = limite_m;
-    const radioInterno = radioCliente + 10;
+    if (!vehiculo.traccarDeviceId) {
+      return res.status(409).json({ error: 'Vehiculo sin traccarDeviceId' });
+    }
 
-    const nuevaZona = {
-      nombre,
-      centro: { lat: latCentro, lon: lonCentro },
+    const pos = await obtenerUltimaPosicionTraccar(vehiculo.traccarDeviceId);
+    const centro = { lat: pos.lat, lon: pos.lon };
+
+    const radioCliente = limite;
+    const radioInterno = limite + 10;
+
+    const zonaSegura = {
+      nombre: nombre || 'Zona Segura',
+      centro,
       radio_cliente_m: radioCliente,
       radio_interno_m: radioInterno,
       diasSemana: diasAccion,
       horaInicio,
       horaFin,
-      activo: !!activo
+      activo: !!activo,
+      ultimaAlertaActiva: false
     };
 
-    config.zonaSegura = nuevaZona;
-    guardarVehiculos();
-
-    // Reiniciar estado de zona en memoria
-    ESTADO_ZONA[vehiculoId] = 'desconocido';
+    vehiculo.zonaSegura = zonaSegura;
+    vehiculo.actualizadoEn = new Date().toISOString();
+    guardarVehiculos(vehiculos);
 
     return res.json({
       ok: true,
       vehiculoId,
-      contratoId: config.contratoId,
-      zonaSegura: nuevaZona,
-      yaExistiaActiva: zonaActivaYa,
+      contratoId: vehiculo.contratoId,
+      zonaSegura,
       lejos_de_zona: false,
       distancia_m: 0,
-      mensaje: nuevaZona.activo
+      mensaje: zonaSegura.activo
         ? 'Zona Segura configurada y activada correctamente.'
-        : 'Zona Segura configurada pero inactiva.'
+        : 'Zona Segura configurada pero desactivada.'
     });
   } catch (err) {
-    console.error(
-      'Error en POST /api/vehiculos/:vehiculoId/zona-segura:',
-      err.message
-    );
-    if (err.response) {
-      console.error('Status:', err.response.status);
-      console.error('Data:', err.response.data);
-    }
+    console.error('Error configurando Zona Segura:', err);
     return res.status(500).json({
       error: 'Error configurando Zona Segura',
-      detalle: err.response ? `${err.response.status}` : err.message
+      detalle: err.message
     });
   }
 });
 
-// Desactivar Zona Segura (Z2)
+app.get('/api/vehiculos/:vehiculoId/zona-segura', (req, res) => {
+  const { vehiculoId } = req.params;
+  const vehiculos = cargarVehiculos();
+  const vehiculo = vehiculos[vehiculoId];
+
+  if (!vehiculo) {
+    return res.status(404).json({ error: 'Vehiculo no configurado en el Orquestador' });
+  }
+
+  if (!vehiculo.zonaSegura) {
+    return res.status(404).json({ error: 'Zona Segura no configurada' });
+  }
+
+  return res.json({
+    vehiculoId,
+    contratoId: vehiculo.contratoId,
+    zonaSegura: vehiculo.zonaSegura
+  });
+});
+
 app.post('/api/vehiculos/:vehiculoId/zona-segura/desactivar', (req, res) => {
-  const vehiculoId = req.params.vehiculoId;
-  const config = VEHICULOS[vehiculoId];
+  const { vehiculoId } = req.params;
+  const vehiculos = cargarVehiculos();
+  const vehiculo = vehiculos[vehiculoId];
 
-  if (!config) {
-    return res
-      .status(404)
-      .json({ error: 'Vehiculo no configurado en el Orquestador' });
+  if (!vehiculo) {
+    return res.status(404).json({ error: 'Vehiculo no configurado en el Orquestador' });
   }
 
-  const zona = config.zonaSegura;
-
-  if (!zona) {
-    return res.json({
-      ok: false,
-      vehiculoId,
-      contratoId: config.contratoId,
-      mensaje: 'El vehiculo no tiene Zona Segura configurada.'
-    });
+  if (!vehiculo.zonaSegura) {
+    return res.status(404).json({ error: 'Zona Segura no configurada' });
   }
 
-  if (zona.activo === false) {
-    return res.json({
-      ok: false,
-      vehiculoId,
-      contratoId: config.contratoId,
-      zonaSegura: {
-        nombre: zona.nombre,
-        activo: zona.activo
-      },
-      mensaje: 'La Zona Segura ya se encontraba desactivada.'
-    });
-  }
+  vehiculo.zonaSegura.activo = false;
+  vehiculo.zonaSegura.ultimaAlertaActiva = false;
+  vehiculo.actualizadoEn = new Date().toISOString();
+  guardarVehiculos(vehiculos);
 
-// ACTIVAR Zona Segura existente
+  return res.json({
+    ok: true,
+    vehiculoId,
+    contratoId: vehiculo.contratoId,
+    zonaSegura: vehiculo.zonaSegura,
+    mensaje: 'Zona Segura desactivada correctamente'
+  });
+});
+
 app.post('/api/vehiculos/:vehiculoId/zona-segura/activar', (req, res) => {
   try {
     const { vehiculoId } = req.params;
-
-    // OJO: cargarVehiculos devuelve directamente el mapa { [vehiculoId]: vehiculo }
     const vehiculos = cargarVehiculos();
     const vehiculo = vehiculos[vehiculoId];
 
@@ -1308,8 +873,9 @@ app.post('/api/vehiculos/:vehiculoId/zona-segura/activar', (req, res) => {
       });
     }
 
-    // Solo prendemos la zona, sin cambiar la configuración
     vehiculo.zonaSegura.activo = true;
+    vehiculo.zonaSegura.ultimaAlertaActiva = false;
+    vehiculo.actualizadoEn = new Date().toISOString();
 
     guardarVehiculos(vehiculos);
 
@@ -1329,386 +895,158 @@ app.post('/api/vehiculos/:vehiculoId/zona-segura/activar', (req, res) => {
   }
 });
 
-
-  zona.activo = false;
-  guardarVehiculos();
-
-  // Estado en memoria deja de importar, pero lo reseteamos por claridad
-  ESTADO_ZONA[vehiculoId] = 'desconocido';
-
-  return res.json({
-    ok: true,
-    vehiculoId,
-    contratoId: config.contratoId,
-    zonaSegura: {
-      nombre: zona.nombre,
-      activo: zona.activo
-    },
-    mensaje:
-      'Zona Segura desactivada. La configuracion se mantiene pero no generara alertas.'
-  });
-});
-
-// Obtener configuracion de Zona Segura
-app.get('/api/vehiculos/:vehiculoId/zona-segura', (req, res) => {
-  const vehiculoId = req.params.vehiculoId;
-  const config = VEHICULOS[vehiculoId];
-
-  if (!config) {
-    return res
-      .status(404)
-      .json({ error: 'Vehiculo no configurado en el Orquestador' });
-  }
-
-  if (!config.zonaSegura) {
-    return res.json({
-      vehiculoId,
-      contratoId: config.contratoId,
-      tiene_zona_segura: false,
-      zonaSegura: null
-    });
-  }
-
-  return res.json({
-    vehiculoId,
-    contratoId: config.contratoId,
-    tiene_zona_segura: true,
-    zonaSegura: config.zonaSegura
-  });
-});
-
-// Evaluar si el vehiculo esta dentro/fuera de la Zona Segura (consulta puntual)
 app.get('/api/vehiculos/:vehiculoId/check-zona-segura', async (req, res) => {
   try {
-    const vehiculoId = req.params.vehiculoId;
-    const config = VEHICULOS[vehiculoId];
+    const { vehiculoId } = req.params;
+    const vehiculos = cargarVehiculos();
+    const vehiculo = vehiculos[vehiculoId];
 
-    if (!config) {
-      return res
-        .status(404)
-        .json({ error: 'Vehiculo no configurado en el Orquestador' });
+    if (!vehiculo) {
+      return res.status(404).json({ error: 'Vehiculo no configurado en el Orquestador' });
     }
 
-    if (config.activo === false) {
-      return res.status(409).json({
-        error: 'Vehiculo inactivo; no se evalua Zona Segura.',
-        motivo_inactivacion: config.motivoInactivacion || null
-      });
-    }
-
-    if (!config.uniqueId) {
-      return res.status(409).json({
-        error:
-          'El vehiculo no tiene uniqueId asignado. No se puede evaluar Zona Segura.'
-      });
-    }
-
-    if (!config.zonaSegura) {
+    const zona = vehiculo.zonaSegura;
+    if (!zona) {
       return res.json({
         vehiculoId,
-        contratoId: config.contratoId,
-        tiene_zona_segura: false,
-        activa: false,
-        aplica_ventana: false,
-        fuera_de_zona: false,
-        motivo: 'SIN_CONFIG'
+        contratoId: vehiculo.contratoId,
+        tiene_zona_segura: false
       });
     }
 
-    const {
-      centro,
-      radio_cliente_m,
-      radio_interno_m,
-      diasSemana,
-      horaInicio,
-      horaFin,
-      activo: zonaActiva
-    } = config.zonaSegura;
-
-    if (!zonaActiva) {
-      return res.json({
-        vehiculoId,
-        contratoId: config.contratoId,
-        tiene_zona_segura: true,
-        activa: false,
-        aplica_ventana: false,
-        fuera_de_zona: false,
-        motivo: 'ZONA_INACTIVA'
-      });
+    if (!vehiculo.traccarDeviceId) {
+      return res.status(409).json({ error: 'Vehiculo sin traccarDeviceId' });
     }
 
-    const ahoraLocal = DateTime.now().setZone('America/Mexico_City');
-    const diaCodigo = codigoDiaSemanaMx(ahoraLocal);
-
-    const aplicaDia = diasSemana.includes(diaCodigo);
-    const aplicaHora = horaDentroDeVentana(horaInicio, horaFin, ahoraLocal);
-    const aplicaVentana = aplicaDia && aplicaHora;
-
-    if (!aplicaVentana) {
-      return res.json({
-        vehiculoId,
-        contratoId: config.contratoId,
-        tiene_zona_segura: true,
-        activa: true,
-        aplica_ventana: false,
-        fuera_de_zona: false,
-        motivo: 'FUERA_HORARIO_O_DIA'
-      });
-    }
-
-    const { position } = await getDeviceAndPositionByUniqueId(config.uniqueId);
-    if (!position) {
-      return res.status(500).json({
-        error:
-          'No se encontro posicion reciente para evaluar Zona Segura.'
-      });
-    }
-
-    const lat = position.latitude;
-    const lon = position.longitude;
-
-    const dist = distanciaMetros(centro.lat, centro.lon, lat, lon);
-    const radioEval = radio_interno_m;
-    const fuera = dist > radioEval;
-
-    const rawTime =
-      position.serverTime || position.deviceTime || position.fixTime || null;
-    const horaLocalStr = utcToLocalMx(rawTime);
+    const pos = await obtenerUltimaPosicionTraccar(vehiculo.traccarDeviceId);
+    const dtLocal = DateTime.fromISO(pos.local);
+    const aplicaVentana = zona.activo && estaEnVentanaHorario(zona, dtLocal);
+    const dist = distanciaMetros(zona.centro.lat, zona.centro.lon, pos.lat, pos.lon);
+    const fuera = dist > zona.radio_interno_m;
 
     return res.json({
       vehiculoId,
-      contratoId: config.contratoId,
+      contratoId: vehiculo.contratoId,
       tiene_zona_segura: true,
-      activa: true,
-      aplica_ventana: true,
+      zona_activa: zona.activo,
+      aplica_ventana: aplicaVentana,
       fuera_de_zona: fuera,
       distancia_m: dist,
-      radio_cliente_m,
-      radio_interno_m,
-      lat,
-      lon,
-      hora_ultima_posicion_utc: rawTime,
-      hora_ultima_posicion_local: horaLocalStr,
-      evento_sugerido: fuera ? 'FUERA_DE_ZONA_SEGURA' : null
+      hora_local: pos.local,
+      zonaSegura: zona
     });
   } catch (err) {
-    console.error(
-      'Error en GET /api/vehiculos/:vehiculoId/check-zona-segura:',
-      err.message
-    );
-    if (err.response) {
-      console.error('Status:', err.response.status);
-      console.error('Data:', err.response.data);
-    }
+    console.error('Error en check-zona-segura:', err);
     return res.status(500).json({
       error: 'Error evaluando Zona Segura',
-      detalle: err.response ? `${err.response.status}` : err.message
+      detalle: err.message
     });
   }
 });
 
-// ---------------------------
-// 11) Siniestros: iniciar y cerrar
-// ---------------------------
+// ---------- Motor de Zona Segura ----------
 
-// S1 - Iniciar protocolo de siniestro
-app.post('/api/vehiculos/:vehiculoId/siniestro/iniciar', (req, res) => {
-  const vehiculoId = req.params.vehiculoId;
-  const config = VEHICULOS[vehiculoId];
+const ORQ_EVENT_URL = process.env.ORQ_EVENT_URL || null;
+const ZONA_SEGURA_INTERVALO_SEGUNDOS = parseInt(
+  process.env.ZONA_SEGURA_INTERVALO_SEGUNDOS || '60',
+  10
+);
 
-  if (!config) {
-    return res
-      .status(404)
-      .json({ error: 'Vehiculo no configurado en el Orquestador' });
-  }
+async function evaluarZonaSeguraParaVehiculo(vehiculoId, vehiculo) {
+  const zona = vehiculo.zonaSegura;
+  if (!zona || !zona.activo) return;
+  if (!vehiculo.traccarDeviceId) return;
+  if (!ORQ_EVENT_URL) return;
 
-  if (config.activo === false) {
-    return res.status(409).json({
-      error: 'Vehiculo inactivo; no se puede iniciar siniestro.',
-      motivo_inactivacion: config.motivoInactivacion || null
-    });
-  }
-
-  const { causa, canal } = req.body || {};
-  const yaEnSiniestro = config.modoSiniestro === true;
-
-  const ahoraIso = new Date().toISOString();
-
-  config.modoSiniestro = true;
-  config.siniestro = {
-    activo: true,
-    causa: causa || null,
-    canal: canal || null,
-    horaInicio: ahoraIso,
-    horaCierre: null,
-    resultado: null,
-    ultimaUbicacionCierre: null
-  };
-
-  guardarVehiculos();
-
-  return res.json({
-    ok: true,
-    vehiculoId,
-    contratoId: config.contratoId,
-    modoSiniestro: true,
-    yaEnSiniestro,
-    causa: config.siniestro.causa,
-    canal: config.siniestro.canal,
-    horaInicio: ahoraIso,
-    mensaje: `Siniestro iniciado para el vehiculo ${vehiculoId}.`
-  });
-});
-
-// S4 - Cerrar siniestro (con reanudacion si corresponde)
-app.post('/api/vehiculos/:vehiculoId/siniestro/cerrar', async (req, res) => {
   try {
-    const vehiculoId = req.params.vehiculoId;
-    const config = VEHICULOS[vehiculoId];
+    const pos = await obtenerUltimaPosicionTraccar(vehiculo.traccarDeviceId);
+    const dtLocal = DateTime.fromISO(pos.local);
+    const aplicaVentana = estaEnVentanaHorario(zona, dtLocal);
+    const dist = distanciaMetros(zona.centro.lat, zona.centro.lon, pos.lat, pos.lon);
+    const fuera = dist > zona.radio_interno_m;
 
-    if (!config) {
-      return res
-        .status(404)
-        .json({ error: 'Vehiculo no configurado en el Orquestador' });
-    }
+    let huboCambio = false;
 
-    const { resultado } = req.body || {};
-    if (!['recuperado', 'no_recuperado'].includes(resultado)) {
-      return res.status(400).json({
-        error: 'resultado debe ser "recuperado" o "no_recuperado".'
-      });
-    }
-
-    if (!config.uniqueId) {
-      return res.status(409).json({
-        error:
-          'El vehiculo no tiene uniqueId asignado. No se puede cerrar siniestro con reanudacion.'
-      });
-    }
-
-    let reanudoMotor = false;
-    let comandoId = null;
-
-    if (ESTADO_CORTE[vehiculoId] === 'cortado') {
-      try {
-        const { command } = await sendCommandToDevice(
-          config.uniqueId,
-          'engineResume'
-        );
-        ESTADO_CORTE[vehiculoId] = 'normal';
-        reanudoMotor = true;
-        comandoId = command.id;
-      } catch (err) {
-        console.error(
-          'Error reanudando motor al cerrar siniestro:',
-          err.message
-        );
-        if (err.response) {
-          console.error('Status:', err.response.status);
-          console.error('Data:', err.response.data);
-        }
-        return res.status(500).json({
-          error: 'No se pudo reanudar el motor al cerrar el siniestro',
-          detalle: err.response ? `${err.response.status}` : err.message
-        });
-      }
-    }
-
-    let ultimaUbicacion = null;
-    try {
-      const { position } = await getDeviceAndPositionByUniqueId(
-        config.uniqueId
-      );
-      if (position) {
-        const rawTime =
-          position.serverTime ||
-          position.deviceTime ||
-          position.fixTime ||
-          null;
-
-        const horaLocal = utcToLocalMx(rawTime);
-
-        ultimaUbicacion = {
-          lat: position.latitude,
-          lon: position.longitude,
-          hora_utc: rawTime,
-          hora_local: horaLocal
+    if (aplicaVentana && fuera) {
+      if (!zona.ultimaAlertaActiva) {
+        const payload = {
+          vehiculoId,
+          contratoId: vehiculo.contratoId,
+          evento: 'FUERA_DE_ZONA_SEGURA',
+          distancia_m: dist,
+          horaEvento: dtLocal.toISO(),
+          zonaSegura: {
+            nombre: zona.nombre,
+            centro: zona.centro,
+            radio_cliente_m: zona.radio_cliente_m,
+            radio_interno_m: zona.radio_interno_m,
+            diasSemana: zona.diasSemana,
+            horaInicio: zona.horaInicio,
+            horaFin: zona.horaFin
+          }
         };
+        try {
+          await axios.post(`${ORQ_EVENT_URL}/eventos/zona-segura`, payload);
+        } catch (postErr) {
+          console.error(
+            'Error notificando salida de Zona Segura al Orquestador:',
+            postErr.message
+          );
+        }
+        zona.ultimaAlertaActiva = true;
+        huboCambio = true;
       }
-    } catch (err) {
-      console.error(
-        'Error obteniendo posicion al cerrar siniestro:',
-        err.message
-      );
-      if (err.response) {
-        console.error('Status:', err.response.status);
-        console.error('Data:', err.response.data);
+    } else {
+      if (zona.ultimaAlertaActiva) {
+        zona.ultimaAlertaActiva = false;
+        huboCambio = true;
       }
     }
 
-    const ahoraIso = new Date().toISOString();
-
-    config.modoSiniestro = false;
-    config.siniestro = {
-      ...(config.siniestro || {}),
-      activo: false,
-      resultado,
-      horaInicio: (config.siniestro && config.siniestro.horaInicio) || null,
-      horaCierre: ahoraIso,
-      ultimaUbicacionCierre: ultimaUbicacion
-    };
-
-    guardarVehiculos();
-
-    return res.json({
-      ok: true,
-      vehiculoId,
-      contratoId: config.contratoId,
-      resultado,
-      modoSiniestro: false,
-      reanudo_motor: reanudoMotor,
-      comandoId,
-      horaInicio: config.siniestro.horaInicio,
-      horaCierre: ahoraIso,
-      ultima_ubicacion_cierre: ultimaUbicacion,
-      mensaje:
-        resultado === 'recuperado'
-          ? 'Siniestro cerrado. Vehiculo marcado como recuperado.'
-          : 'Siniestro cerrado. Vehiculo marcado como no recuperado.'
-    });
+    if (huboCambio) {
+      const vehiculos = cargarVehiculos();
+      if (vehiculos[vehiculoId] && vehiculos[vehiculoId].zonaSegura) {
+        vehiculos[vehiculoId].zonaSegura.ultimaAlertaActiva = zona.ultimaAlertaActiva;
+        guardarVehiculos(vehiculos);
+      }
+    }
   } catch (err) {
-    console.error(
-      'Error en POST /api/vehiculos/:vehiculoId/siniestro/cerrar:',
-      err.message
-    );
-    if (err.response) {
-      console.error('Status:', err.response.status);
-      console.error('Data:', err.response.data);
-    }
-    return res.status(500).json({
-      error: 'No se pudo cerrar el siniestro',
-      detalle: err.response ? `${err.response.status}` : err.message
-    });
+    console.error(`Error evaluando Zona Segura para ${vehiculoId}:`, err.message);
   }
-});
+}
 
-// ---------------------------
-// Inicio del servidor y motor de Zona Segura
-// ---------------------------
+async function motorZonaSegura() {
+  try {
+    const vehiculos = cargarVehiculos();
+    const ids = Object.keys(vehiculos);
+    for (const vehiculoId of ids) {
+      const vehiculo = vehiculos[vehiculoId];
+      if (vehiculo && vehiculo.zonaSegura && vehiculo.zonaSegura.activo) {
+        await evaluarZonaSeguraParaVehiculo(vehiculoId, vehiculo);
+      }
+    }
+  } catch (err) {
+    console.error('Error en motorZonaSegura:', err.message);
+  }
+}
+
+if (ZONA_SEGURA_INTERVALO_SEGUNDOS > 0) {
+  console.log(
+    'Motor de Zona Segura activo. Intervalo:',
+    ZONA_SEGURA_INTERVALO_SEGUNDOS,
+    'segundos.'
+  );
+  setInterval(() => {
+    motorZonaSegura().catch((err) =>
+      console.error('Error en ejecución de motorZonaSegura:', err.message)
+    );
+  }, ZONA_SEGURA_INTERVALO_SEGUNDOS * 1000);
+} else {
+  console.log('Motor de Zona Segura DESACTIVADO por configuración.');
+}
+
+// ---------- Arranque ----------
 
 app.listen(PORT, () => {
   console.log(`AMA Orquestador escuchando en puerto ${PORT}`);
-
-  if (ZONA_SEGURA_INTERVALO_MS > 0) {
-    setInterval(() => {
-      evaluarZonasSegurasYGenerarEventos().catch((err) =>
-        console.error('Error en ciclo de Zona Segura:', err.message)
-      );
-    }, ZONA_SEGURA_INTERVALO_MS);
-    console.log(
-      `Motor de Zona Segura activo. Intervalo: ${ZONA_SEGURA_INTERVALO_SEGUNDOS} segundos.`
-    );
-  } else {
-    console.log('Motor de Zona Segura desactivado (intervalo <= 0).');
-  }
 });
