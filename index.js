@@ -1287,10 +1287,11 @@ app.post('/api/vehiculos/:vehiculoId/zona-segura/desactivar', (req, res) => {
   }
 
 // ACTIVAR Zona Segura existente
-//texto prueba
 app.post('/api/vehiculos/:vehiculoId/zona-segura/activar', (req, res) => {
   try {
     const { vehiculoId } = req.params;
+
+    // OJO: cargarVehiculos devuelve directamente el mapa { [vehiculoId]: vehiculo }
     const vehiculos = cargarVehiculos();
     const vehiculo = vehiculos[vehiculoId];
 
@@ -1307,7 +1308,7 @@ app.post('/api/vehiculos/:vehiculoId/zona-segura/activar', (req, res) => {
       });
     }
 
-    // Solo prendemos la zona, sin cambiar config
+    // Solo prendemos la zona, sin cambiar la configuración
     vehiculo.zonaSegura.activo = true;
 
     guardarVehiculos(vehiculos);
@@ -1327,6 +1328,7 @@ app.post('/api/vehiculos/:vehiculoId/zona-segura/activar', (req, res) => {
     });
   }
 });
+
 
   zona.activo = false;
   guardarVehiculos();
