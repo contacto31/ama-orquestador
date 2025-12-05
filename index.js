@@ -1287,6 +1287,7 @@ app.post('/api/vehiculos/:vehiculoId/zona-segura/desactivar', (req, res) => {
   }
 
 // ACTIVAR Zona Segura existente
+//texto prueba
 app.post('/api/vehiculos/:vehiculoId/zona-segura/activar', (req, res) => {
   try {
     const { vehiculoId } = req.params;
