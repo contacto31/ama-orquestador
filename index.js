@@ -371,6 +371,25 @@ async function evaluarZonasSegurasYGenerarEventos() {
   }
 }
 
+// Middleware de autenticación con API key para AMA
+const AMA_API_KEY = process.env.AMA_API_KEY;
+
+app.use((req, res, next) => {
+  // Si por alguna razón no se configuró la key, logueamos y dejamos pasar
+  if (!AMA_API_KEY) {
+    console.warn('⚠️ AMA_API_KEY no está definida. El API está sin protección.');
+    return next();
+  }
+
+  const token = req.header('x-ama-api-key');
+
+  if (!token || token !== AMA_API_KEY) {
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+
+  next();
+});
+
 // ---------------------------
 // Endpoints
 // ---------------------------
