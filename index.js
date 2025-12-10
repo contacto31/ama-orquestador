@@ -49,9 +49,9 @@ console.log('Usando archivo de vehículos en:', VEHICULOS_FILE);
 
 const PORT = process.env.PORT || 3000;
 
-const TRACCAR_URL = process.env.TRACCAR_URL; // ej. "http://31.97.135.112:8082"
-const TRACCAR_USER = process.env.TRACCAR_USER;
-const TRACCAR_PASSWORD = process.env.TRACCAR_PASSWORD;
+// Nueva config de Traccar: HTTPS + token
+const TRACCAR_BASE_URL = process.env.TRACCAR_BASE_URL; // ej. "https://panel.amatracksafe.com.mx/api"
+const TRACCAR_API_TOKEN = process.env.TRACCAR_API_TOKEN;
 
 // URL del orquestador para eventos de Zona Segura
 const ORQ_EVENT_URL = process.env.ORQ_EVENT_URL || null;
@@ -66,9 +66,13 @@ const ZONA_SEGURA_INTERVALO_MS =
     ? 0
     : ZONA_SEGURA_INTERVALO_SEGUNDOS * 1000;
 
-if (!TRACCAR_URL || !TRACCAR_USER || !TRACCAR_PASSWORD) {
+if (!TRACCAR_BASE_URL || !TRACCAR_API_TOKEN) {
   console.warn(
-    '⚠️ Falta configurar TRACCAR_URL / TRACCAR_USER / TRACCAR_PASSWORD en .env'
+    '⚠️ Falta configurar TRACCAR_BASE_URL / TRACCAR_API_TOKEN en .env'
+  );
+} else if (!TRACCAR_BASE_URL.startsWith('https://')) {
+  console.warn(
+    '⚠️ TRACCAR_BASE_URL no usa HTTPS. Se recomienda fuertemente usar https:// para Traccar.'
   );
 }
 if (!ORQ_EVENT_URL) {
@@ -78,13 +82,10 @@ if (!ORQ_EVENT_URL) {
 }
 
 const traccarClient = axios.create({
-  baseURL: TRACCAR_URL,
-  auth: {
-    username: TRACCAR_USER,
-    password: TRACCAR_PASSWORD
-  },
+  baseURL: TRACCAR_BASE_URL,
   headers: {
-    'Content-Type': 'application/json'
+    'Content-Type': 'application/json',
+    Authorization: `Bearer ${TRACCAR_API_TOKEN}`
   },
   timeout: 10000
 });
@@ -129,7 +130,7 @@ cargarVehiculos();
 // ---------------------------
 
 async function getAllDevices() {
-  const resp = await traccarClient.get('/api/devices');
+  const resp = await traccarClient.get('/devices');
   return resp.data || [];
 }
 
@@ -142,7 +143,7 @@ async function getDeviceAndPositionByUniqueId(uniqueId) {
 
   let position = null;
   if (device.positionId) {
-    const posResp = await traccarClient.get('/api/positions', {
+    const posResp = await traccarClient.get('/positions', {
       params: { id: device.positionId }
     });
     if (Array.isArray(posResp.data) && posResp.data.length > 0) {
@@ -159,14 +160,14 @@ async function crearOActualizarDeviceEnTraccar(uniqueId, name) {
 
   if (device) {
     if (device.name !== name) {
-      const resp = await traccarClient.put(`/api/devices/${device.id}`, {
+      const resp = await traccarClient.put(`/devices/${device.id}`, {
         ...device,
         name
       });
       device = resp.data;
     }
   } else {
-    const resp = await traccarClient.post('/api/devices', {
+    const resp = await traccarClient.post('/devices', {
       name,
       uniqueId
     });
@@ -179,7 +180,7 @@ async function crearOActualizarDeviceEnTraccar(uniqueId, name) {
 async function sendCommandToDevice(uniqueId, type) {
   const { device } = await getDeviceAndPositionByUniqueId(uniqueId);
 
-  const resp = await traccarClient.post('/api/commands/send', {
+  const resp = await traccarClient.post('/commands/send', {
     deviceId: device.id,
     type
   });
