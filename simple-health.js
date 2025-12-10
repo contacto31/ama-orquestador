@@ -1,17 +1,24 @@
-const express = require('express');
+const http = require('http');
 
-const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.get('/api/health', (req, res) => {
-  res.json({
-    ok: true,
-    mensaje: 'Servidor simple AMA Orquestador OK',
-    port: PORT,
-    url: req.url,
-  });
+const server = http.createServer((req, res) => {
+  if (req.url === '/api/health') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(
+      JSON.stringify({
+        ok: true,
+        mensaje: 'Servidor simple AMA Orquestador OK',
+        port: PORT,
+        url: req.url,
+      })
+    );
+  } else {
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Not found', url: req.url }));
+  }
 });
 
-app.listen(PORT, () => {
-  console.log(`🚀 Servidor simple escuchando en puerto ${PORT}`);
+server.listen(PORT, () => {
+  console.log(`🚀 Servidor HTTP simple escuchando en puerto ${PORT}`);
 });
