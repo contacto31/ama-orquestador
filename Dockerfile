@@ -2,13 +2,17 @@ FROM node:18-alpine
 
 WORKDIR /app
 
-# Solo necesitamos simple-health.js y package.json para esta prueba
+# Instalar dependencias
 COPY package*.json ./
-COPY simple-health.js ./
+RUN npm ci --omit=dev
+
+# Copiar el resto del código (index.js, etc.)
+COPY . .
 
 ENV NODE_ENV=production
 ENV PORT=3000
 
 EXPOSE 3000
 
-CMD ["node", "simple-health.js"]
+# Arrancar usando el script start (node index.js)
+CMD ["npm", "start"]
